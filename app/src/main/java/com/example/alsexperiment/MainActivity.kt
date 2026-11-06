@@ -243,6 +243,3 @@ fun ALSExperimentScreen() {
         )
     }
 }
-
-
-이거 코드 깃허브에 올리고 싶어
