@@ -20,7 +20,18 @@ BUILD SUCCESSFUL in 1m 28s
   - Unix 나노초 정수 하위 자릿수 보존과 측정 시작 기준 경과 시간 확인.
   - 소수점 구분자가 쉼표인 시스템 언어에서도 CSV 숫자 형식 유지 확인.
 - Android lint 오류 0개, 경고 5개.
-- APK 생성 작업(assemble/package)은 실행하지 않았고 `app/build`의 APK 파일도 0개다.
+- 최초 검사에는 APK 생성 작업을 포함하지 않았다. 이후 아래와 같이 테스트 APK를 생성했다.
+
+## 테스트 APK 빌드
+
+`python tools/check_android.py --apk`로 검사와 `:app:assembleDebug`를 실행했다.
+`BUILD SUCCESSFUL in 45s`, 51개 작업 중 20개 실행, 31개 최신 상태로 완료했다.
+
+- 파일: `app/build/outputs/apk/debug/app-debug.apk`
+- 크기: 약 8.35 MiB
+- applicationId: `com.example.alsexperiment`, versionName: `0.3`, minSdk: `25`
+- `apksigner verify --verbose` 성공. APK Signature Scheme v2 서명 확인.
+- SHA-256: `f3cdfe6534ee288e21143c04b13ce0496721f1f6623c5ed573415438c9a750ef`
 
 ## 남은 경고
 
@@ -43,7 +54,7 @@ Windows 한글 경로에서 Gradle 테스트 프로세스가 GradleWorkerMain을
 
 ## 아직 확인하지 않은 범위
 
-APK 패키징·서명·설치, SM-T550에서의 영상 디코딩, 실제 센서 이벤트 빈도,
+SM-T550에서의 APK 설치, 영상 디코딩, 실제 센서 이벤트 빈도,
 CSV·ZIP 내보내기, 앱 중단·재시작 및 반복 측정은 실기기 확인이 필요하다.
 호스트 단위 테스트 성공은 센서 100Hz 또는 실제 발광 시각 동기화의 검증을 의미하지 않는다.
 

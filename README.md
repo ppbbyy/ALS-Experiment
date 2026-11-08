@@ -2,7 +2,7 @@
 
 Galaxy Tab A SM-T550의 조도 측정 앱. Android 7.1(API 25) 이상을 대상으로 한다.
 Kotlin 컴파일, CSV 단위 테스트 2개, Android lint 검사를 통과했다.
-실제 기기에서의 실행과 APK 빌드는 아직 검증하지 않았다.
+테스트용 APK 빌드와 서명 검증을 완료했다. 실제 기기에서의 실행은 아직 검증하지 않았다.
 검사 범위와 남은 경고는 [BUILD_CHECK.md](BUILD_CHECK.md)에 기록했다.
 
 Windows에서 직접 클릭할 수 있는 별도 Kivy UI는 [kivy_preview](kivy_preview/README.md)에 있다.
@@ -73,6 +73,16 @@ Windows에서 `python tools/check_android.py`를 실행하면 의존성 검사, 
 
 APK를 만드는 후속 단계의 준비 사항:
 
+이 PC에서 테스트용 APK를 만들려면 저장소 루트에서 다음 명령을 실행한다.
+`--apk`를 붙였을 때만 검사 후 `assembleDebug`로 디버그 APK를 생성한다.
+
+```powershell
+python tools/check_android.py --apk
+```
+
+완료 파일은 `app/build/outputs/apk/debug/app-debug.apk`다. 태블릿으로 복사해
+설치할 수 있다. 이 명령으로 테스트용 APK 빌드와 서명 검증을 완료했다.
+
 - JDK 17, Android SDK Platform 35, SDK Build Tools, Gradle 8.9가 필요하다.
 - Android Studio에서 저장소 루트를 열고 SDK 경로를 설정한다.
 - Gradle Wrapper는 아직 포함되어 있지 않다. 설치한 Gradle 8.9로 루트에서
@@ -85,6 +95,6 @@ APK를 만드는 후속 단계의 준비 사항:
 현재 고정한 Compose/Activity/Lifecycle 의존성을 사용하고 자동 최신화하지 않는다.
 Java 17은 빌드 PC용이며 태블릿에 Java 17을 설치하는 것이 아니다.
 현재 개발 환경에 도구를 준비하여 컴파일·단위 테스트·lint 검사를 완료했다.
-APK 패키징은 실행하지 않았다. API 25에서 설치·영상 재생·CSV 내보내기 및 실제 센서 Hz를 검증해야 한다.
+APK 패키징과 서명 검증을 완료했다. API 25에서 설치·영상 재생·CSV 내보내기 및 실제 센서 Hz를 검증해야 한다.
 
 `versions/MainActivity_v2.kt`는 보관용 이전 코드이며 빌드 소스에 포함되지 않는다.

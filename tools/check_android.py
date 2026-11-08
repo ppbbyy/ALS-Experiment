@@ -1,4 +1,5 @@
-"""Prepare project-local build tools and compile/test/lint without packaging an APK."""
+"""Check Android sources; package a debug APK only with explicit --apk."""
+import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import ctypes
@@ -43,7 +44,7 @@ def unpack(url, name, folder, checksum=None):
             archive.extractall(folder)
 
 
-def main():
+def main(build_apk=False):
     gradle_sha = urllib.request.urlopen('https://services.gradle.org/distributions/gradle-8.9-bin.zip.sha256', timeout=60).read().decode().strip()
     jobs = [
         ('https://aka.ms/download-jdk/microsoft-jdk-17-windows-x64.zip', 'jdk17.zip', TOOLS / 'jdk', None),
@@ -65,11 +66,13 @@ def main():
         subprocess.run(['subst', drive, str(ROOT)], check=True)
         build_root = Path(drive + '\\')
     try:
-        run_checks(build_root)
+        run_checks(build_root, build_apk=build_apk)
     finally:
         write_sdk_property(TOOLS / 'sdk')
         if drive:
             subprocess.run(['subst', drive, '/D'], check=True)
+    if build_apk:
+        print('Debug APK: ' + str(ROOT / 'app/build/outputs/apk/debug/app-debug.apk'), flush=True)
 
 
 def write_sdk_property(sdk):
@@ -77,7 +80,7 @@ def write_sdk_property(sdk):
     (ROOT / 'local.properties').write_text('sdk.dir=' + sdk_property + '\n', encoding='ascii')
 
 
-def run_checks(build_root):
+def run_checks(build_root, build_apk=False):
     build_tools = build_root / '.build-tools'
     jdk = next((build_tools / 'jdk').glob('*/bin/java.exe')).parents[1]
     sdk = build_tools / 'sdk'
@@ -95,9 +98,14 @@ def run_checks(build_root):
     gradle = build_tools / 'gradle/gradle-8.9/bin/gradle.bat'
     commands = [':app:compileDebugKotlin', ':app:testDebugUnitTest', ':app:lintDebug',
                 '--console=plain', '--no-daemon', '-Pandroid.overridePathCheck=true']
-    print('Running compile, unit tests and lint; no assemble/package task', flush=True)
+    if build_apk:
+        commands.insert(3, ':app:assembleDebug')
+    print('Running compile, unit tests and lint' +
+          (' and packaging a debug APK' if build_apk else '; no assemble/package task'), flush=True)
     subprocess.run([str(gradle), *commands], cwd=build_root, env=env, check=True)
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='Check Android code; optionally build a test APK.')
+    parser.add_argument('--apk', action='store_true', help='Also build app-debug.apk after checks.')
+    main(build_apk=parser.parse_args().apk)
