@@ -1,7 +1,9 @@
 # ALS-Experiment
 
 Galaxy Tab A SM-T550의 조도 측정 앱. Android 7.1(API 25) 이상을 대상으로 한다.
+Kotlin 컴파일, CSV 단위 테스트 2개, Android lint 검사를 통과했다.
 실제 기기에서의 실행과 APK 빌드는 아직 검증하지 않았다.
+검사 범위와 남은 경고는 [BUILD_CHECK.md](BUILD_CHECK.md)에 기록했다.
 
 Windows에서 직접 클릭할 수 있는 별도 Kivy UI는 [kivy_preview](kivy_preview/README.md)에 있다.
 루트의 `미리보기 실행.cmd`로 실행하며, 영상 선택·미리보기·5초 카운트다운·중지를 지원한다.
@@ -63,6 +65,14 @@ RGB 채널 의미와 접근 권한은 해당 기기의 제조사 문서 또는 �
 
 ## 빌드 준비
 
+이 작업 환경에서는 JDK/Gradle/SDK를 저장소의 `.build-tools/`에 준비했다.
+Windows에서 `python tools/check_android.py`를 실행하면 의존성 검사, Kotlin 컴파일,
+단위 테스트, lint를 수행한다. APK는 생성하지 않는다. 도구가 없으면 공식 배포처에서
+다운로드하며, 한글 경로 문제를 피하도록 검사 중에만 빈 드라이브 문자를 임시 연결하고
+완료 후 해제한다. 시스템 전체 Java나 PATH 설정은 변경하지 않는다.
+
+APK를 만드는 후속 단계의 준비 사항:
+
 - JDK 17, Android SDK Platform 35, SDK Build Tools, Gradle 8.9가 필요하다.
 - Android Studio에서 저장소 루트를 열고 SDK 경로를 설정한다.
 - Gradle Wrapper는 아직 포함되어 있지 않다. 설치한 Gradle 8.9로 루트에서
@@ -74,7 +84,7 @@ RGB 채널 의미와 접근 권한은 해당 기기의 제조사 문서 또는 �
 `minSdk=25`는 설치 가능한 최소 OS이며 `compileSdk/targetSdk=35`와는 다르다.
 현재 고정한 Compose/Activity/Lifecycle 의존성을 사용하고 자동 최신화하지 않는다.
 Java 17은 빌드 PC용이며 태블릿에 Java 17을 설치하는 것이 아니다.
-현재 개발 환경에서는 Java/Gradle/Android SDK를 확인하지 못하여 빌드와 단위 테스트를
-실행하지 못했다. API 25에서 설치·영상 재생·CSV 내보내기 및 실제 센서 Hz를 검증해야 한다.
+현재 개발 환경에 도구를 준비하여 컴파일·단위 테스트·lint 검사를 완료했다.
+APK 패키징은 실행하지 않았다. API 25에서 설치·영상 재생·CSV 내보내기 및 실제 센서 Hz를 검증해야 한다.
 
 `versions/MainActivity_v2.kt`는 보관용 이전 코드이며 빌드 소스에 포함되지 않는다.

@@ -9,3 +9,4 @@ kivy_preview/.kivy/
 kivy_preview/.test-video.mp4
 kivy_preview/.smoke*.png
 kivy_preview/*.log
+.build-tools/
