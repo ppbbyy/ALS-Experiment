@@ -1,6 +1,18 @@
+// chaerin 기반 전체화면/패턴 라벨 수정본 (2026-11-09).
+// 첨부 영상 확인: paper_style = 12fps, 180프레임, 15초 (4프레임 패턴+2프레임 검정).
+// 3s_pattern_3s_black = 10fps, 1800프레임, 180초 (30+30프레임).
+// pattern_id는 제시 순서 1~30이며, 도형 종류의 고유 번호가 아닙니다.
+// P02/P16, P03/P15는 영상에서 같은 모양으로 반복됩니다.
+// 실행: chaerin 프로젝트의 MainActivity.kt를 이 파일 내용으로 교체하세요.
+// 클래스 이름은 MainActivity 유지. 기존 파일 옆에 추가하면 클래스가 중복됩니다.
+// chaerin의 LightCsv.kt, RawSensorCapture.kt 및 Gradle 설정이 필요합니다.
+// 2026-11-10 개선판 0.5: 최대 속도 요청, 첫 프레임 사전 준비, 종료 경계 필터.
+// 실제 빌드 소스와 versions 보관본을 함께 유지합니다. 실기기 Hz/발광 지연은 재검증해야 합니다.
+
 package com.example.alsexperiment
 
 import android.content.Context
+import android.content.pm.ActivityInfo
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -35,6 +47,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -46,14 +59,13 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
 import kotlin.math.ceil
 import kotlin.math.min
 
-private const val SENSOR_PERIOD_US = 10_000       // 100 Hz 요청 (보장되는 실제 측정 속도는 아님)
+private const val SENSOR_PERIOD_US = SensorManager.SENSOR_DELAY_FASTEST // 최대 속도 요청; 실제 Hz는 timestamp로 검증
 private const val START_DELAY_MS = 5_000L        // 버튼 후 5초
 private const val VIDEO_POLL_MS = 20L           // 영상 위치 조회 목표 간격
+private const val MAX_POSITION_GAP_NS = 100_000_000L // 긴 폴링 공백은 라벨 추정에서 제외
 private const val BOUNDARY_MARGIN_MS = 50.0     // 패턴 전환부에 붙일 주의 플래그 (보장된 오차 한계 X)
 private const val PATTERN_COUNT = 30
 
@@ -66,8 +78,8 @@ private enum class PatternMode(
     val blackFrames: Int,
     val videoFile: String
 ) {
-    PAPER("A. 논문 방식: 패턴 0.333초 / 검정 0.167초", 12, 4, 2, "als_paper_2hz.mp4"),
-    LONG("B. 긴 방식: 패턴 3초 / 검정 3초", 10, 30, 30, "als_3s_3s.mp4");
+    PAPER("A. 논문 방식: 패턴 0.333초 / 검정 0.167초", 12, 4, 2, "ALS_30_patterns_paper_style.mp4"),
+    LONG("B. 긴 방식: 패턴 3초 / 검정 3초", 10, 30, 30, "ALS_30_patterns_3s_pattern_3s_black.mp4");
 
     val patternDurationMs: Double get() = 1000.0 * patternFrames / fps
     val blackDurationMs: Double get() = 1000.0 * blackFrames / fps
@@ -104,12 +116,21 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
     val rawCapture = RawSensorCapture(context)
     var rawSensor by mutableStateOf<Sensor?>(null)
     var scheduleEnabled by mutableStateOf(false)
+    var videoDurationMs by mutableIntStateOf(0)
+        private set
+    val scheduleDurationMatches: Boolean
+        get() = videoDurationMs > 0 &&
+            kotlin.math.abs(videoDurationMs - selectedMode.durationMs) <= 1000.0 / selectedMode.fps
+    private var runScheduleEnabled = false
+    private var runVideoDurationMs = 0
+    private var runDisplayWidth = 0
+    private var runDisplayHeight = 0
     private val main = Handler(Looper.getMainLooper())
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     val sensor: Sensor? = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT)
     private var sensorThread: HandlerThread? = null
     private val samplesLock = Any()
-    private val samples = ArrayList<LuxSample>()
+    private val samples = ArrayList<LuxSample>(24_000)
     private var gateStartNs = Long.MAX_VALUE
     private var gateEndNs = Long.MAX_VALUE
     private var lastLuxUpdateNs = 0L
@@ -127,6 +148,7 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
     private var runFrameCount = 0
     private var previousFrameTimestamp = Long.MIN_VALUE
     private var disposed = false
+    private var screenActive = true
     private var experimentId = ""
     private var wallAnchorEpochMs = 0L
     private var monoAnchorNs = 0L
@@ -138,6 +160,17 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
     private var firstFrameInfoNs: Long? = null
     private var runEndNs = 0L
     private var playbackMoved = false
+    private val preparation = PlaybackPreparation()
+    private var preparationStartedNs = 0L
+    private var preparationReadyNs = 0L
+    private var firstTextureNs: Long? = null
+    private var droppedOutsideWindow = 0
+    private val preparationTimeout = Runnable {
+        if (mediaPlayer != null && !videoReady && phase == RunPhase.IDLE) {
+            releaseMediaPlayer()
+            status = "첫 프레임 준비 시간 초과. 영상을 다시 선택해 주세요."
+        }
+    }
 
     var phase by mutableStateOf(RunPhase.IDLE)
         private set
@@ -198,13 +231,15 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
     }
 
     fun startSensor() {
+        screenActive = true
+        if (phase == RunPhase.IDLE && displaySurface != null && mediaPlayer == null) loadSelectedVideo()
         if (sensorActive) return
         val light = sensor
         if (light == null) {
             status = "이 기기에서 TYPE_LIGHT 센서를 찾지 못했습니다."
             return
         }
-        val thread = HandlerThread("Als100HzCapture")
+        val thread = HandlerThread("AlsFastestCapture", android.os.Process.THREAD_PRIORITY_MORE_FAVORABLE)
         thread.start()
         sensorThread = thread
         sensorActive = sensorManager.registerListener(
@@ -215,11 +250,13 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
             sensorThread = null
             status = "센서 등록 실패"
         } else {
-            status = "센서 준비 완료 (100Hz 요청)"
+            status = "센서 준비 완료 (최대 속도 요청 · 목표 100Hz)"
         }
     }
 
     fun stopSensor() {
+        screenActive = false
+        if (phase != RunPhase.RUNNING) releaseMediaPlayer()
         if (sensorActive) sensorManager.unregisterListener(this)
         sensorActive = false
         sensorThread?.quitSafely()
@@ -232,12 +269,12 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
         val lux = event.values[0]
         synchronized(samplesLock) {
             // 콜백 수신 지연으로 과거 센서 이벤트가 RUN_BEGIN 이후 들어오는 경우 제외
-            if (event.timestamp >= gateStartNs && event.timestamp < gateEndNs) {
+            if (CaptureWindow.contains(event.timestamp, gateStartNs, gateEndNs)) {
                 samples.add(LuxSample(event.timestamp, receivedNs, lux, event.accuracy))
             }
         }
         // 비실험 화면에서는 0.25초 단위로 최신 측정값만 UI에 전달 (100Hz 콜백 부하 억제)
-        if (receivedNs - lastLuxUpdateNs >= 250_000_000L) {
+        if (phase == RunPhase.IDLE && receivedNs - lastLuxUpdateNs >= 250_000_000L) {
             lastLuxUpdateNs = receivedNs
             main.post { currentLux = lux }
         }
@@ -259,7 +296,7 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
             }
 
             override fun onSurfaceTextureSizeChanged(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
-                mediaPlayer?.let { applyAspectFit(texture, it.videoWidth, it.videoHeight) }
+                applyFullScreenPattern(texture)
             }
 
             override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
@@ -273,7 +310,27 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
             }
 
             override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) {
+                val player = mediaPlayer ?: return
+                if (phase == RunPhase.IDLE && !videoReady) {
+                    // Tablet_03 had an initial timestamp=0 update before the first video frame.
+                    if (surfaceTexture.timestamp == 0L) return
+                    try {
+                        if (preparation.onFrame(player.currentPosition)) {
+                            player.pause()
+                            player.seekTo(0)
+                        }
+                        completePreparationIfReady()
+                    } catch (e: Exception) {
+                        releaseMediaPlayer()
+                        status = "첫 프레임 준비 실패: ${e.message}"
+                    }
+                    return
+                }
                 if (phase != RunPhase.RUNNING) return
+                if (firstTextureNs == null) {
+                    firstTextureNs = SystemClock.elapsedRealtimeNanos()
+                    addMark("VIDEO_FIRST_TEXTURE_UPDATE", firstTextureNs!!)
+                }
                 val timestamp = surfaceTexture.timestamp
                 if (timestamp == previousFrameTimestamp) return
                 previousFrameTimestamp = timestamp
@@ -293,34 +350,41 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
     }
 
     private fun releaseMediaPlayer() {
+        main.removeCallbacks(preparationTimeout)
+        preparation.reset()
         val old = mediaPlayer
         mediaPlayer = null
         videoReady = false
+        videoDurationMs = 0
         if (old != null) {
             try { old.setOnPreparedListener(null) } catch (_: Exception) { }
             try { old.setOnCompletionListener(null) } catch (_: Exception) { }
             try { old.setOnErrorListener(null) } catch (_: Exception) { }
+            try { old.setOnSeekCompleteListener(null) } catch (_: Exception) { }
             try { old.release() } catch (_: Exception) { }
         }
     }
 
-    /** 태블릿 화면 비율(4:3)에 16:9 영상을 찌그러지지 않게 맞춥니다. */
-    private fun applyAspectFit(texture: TextureView, videoWidth: Int, videoHeight: Int) {
-        if (videoWidth <= 0 || videoHeight <= 0 || texture.width <= 0 || texture.height <= 0) return
-        val surfaceWidth = texture.width.toFloat()
-        val surfaceHeight = texture.height.toFloat()
-        val videoAspect = videoWidth.toFloat() / videoHeight
-        val viewAspect = surfaceWidth / surfaceHeight
-        val scaleX = if (videoAspect < viewAspect) videoAspect / viewAspect else 1f
-        val scaleY = if (videoAspect > viewAspect) viewAspect / videoAspect else 1f
-        val matrix = Matrix().apply {
-            setScale(scaleX, scaleY, surfaceWidth / 2f, surfaceHeight / 2f)
-        }
-        texture.setTransform(matrix)
+    private fun completePreparationIfReady() {
+        if (preparation.stage != PlaybackPreparation.Stage.READY || videoReady) return
+        preparationReadyNs = SystemClock.elapsedRealtimeNanos()
+        videoReady = true
+        main.removeCallbacks(preparationTimeout)
+        status = "첫 프레임 준비 및 0ms 복귀 완료"
+    }
+
+    /**
+     * TextureView 기본 매핑은 영상 전체를 뷰 크기에 맞춰 늘립니다.
+     * 항등 행렬로 비율 유지용 축소를 없애 여백/크롭 없이 패턴을 표시합니다.
+     * 화면과 영상 비율이 다르면 가로/세로 배율은 서로 달라집니다.
+     */
+    private fun applyFullScreenPattern(texture: TextureView) {
+        texture.setTransform(Matrix())
     }
 
     fun selectVideo(uri: Uri, name: String) {
         if (phase != RunPhase.IDLE) return
+        scheduleEnabled = false // 다른 영상에는 이전 시간표 확인을 재사용하지 않음
         selectedVideoUri = uri
         selectedVideoName = name.replace('\n', '_').replace('\r', '_')
         loadSelectedVideo()
@@ -342,12 +406,13 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
     fun selectMode(mode: PatternMode) {
         if (phase != RunPhase.IDLE) return
         if (selectedMode == mode) return
+        scheduleEnabled = false
         selectedMode = mode
         loadSelectedVideo()
     }
 
     private fun loadSelectedVideo() {
-        if (disposed || phase != RunPhase.IDLE) return
+        if (disposed || !screenActive || phase != RunPhase.IDLE) return
         val uri = selectedVideoUri ?: run { status = "먼저 영상 파일을 선택하세요"; return }
         val surface = displaySurface ?: run {
             status = "영상 표시 화면 준비 중"
@@ -362,14 +427,25 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
             mediaPlayer = player
             player.setOnPreparedListener { prepared ->
                 if (prepared === mediaPlayer) {
-                    videoReady = true
-                    applyAspectFit(textureView ?: return@setOnPreparedListener,
-                        prepared.videoWidth, prepared.videoHeight)
-                    if (phase == RunPhase.IDLE) status = "영상 준비 완료 (화면 출력 준비 완료)"
+                    videoDurationMs = prepared.duration
+                    if (!scheduleDurationMatches) scheduleEnabled = false
+                    applyFullScreenPattern(textureView ?: return@setOnPreparedListener)
+                    preparation.begin()
+                    status = "검은 화면 뒤에서 첫 프레임 준비 중"
+                    try { prepared.start() } catch (e: Exception) {
+                        releaseMediaPlayer()
+                        status = "영상 사전 재생 실패: ${e.message}"
+                    }
                 }
             }
-            player.setOnVideoSizeChangedListener { changed, width, height ->
-                if (changed === mediaPlayer) textureView?.let { applyAspectFit(it, width, height) }
+            player.setOnSeekCompleteListener { completed ->
+                if (completed === mediaPlayer && phase == RunPhase.IDLE) {
+                    preparation.onSeekComplete(completed.currentPosition)
+                    completePreparationIfReady()
+                }
+            }
+            player.setOnVideoSizeChangedListener { changed, _, _ ->
+                if (changed === mediaPlayer) textureView?.let { applyFullScreenPattern(it) }
             }
             player.setOnInfoListener { infoPlayer, what, extra ->
                 if (infoPlayer === mediaPlayer) {
@@ -395,12 +471,16 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
                     status = "영상 오류 (MediaPlayer): $what / $extra"
                     if (phase == RunPhase.RUNNING) finish("video_error_${what}_${extra}")
                     else if (phase == RunPhase.COUNTDOWN) cancelCountdown()
+                    else releaseMediaPlayer()
                 }
                 true
             }
             player.setSurface(surface)
             player.setVolume(0f, 0f)
             player.setDataSource(context, videoUri)
+            preparationStartedNs = SystemClock.elapsedRealtimeNanos()
+            preparationReadyNs = 0L
+            main.postDelayed(preparationTimeout, 15_000L)
             player.prepareAsync()
         } catch (e: Exception) {
             releaseMediaPlayer()
@@ -414,6 +494,12 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
             status = "영상 준비와 조도 센서 연결 상태를 확인해 주세요."
             return
         }
+        if (scheduleEnabled && !scheduleDurationMatches) {
+            status = "영상 길이가 시간표와 다릅니다. 시간표를 확인하거나 패턴 라벨을 해제하세요."
+            return
+        }
+        runScheduleEnabled = scheduleEnabled
+        runVideoDurationMs = videoDurationMs
         modeUsed = selectedMode
         rawCapture.prepare(rawSensor)
         runVideoName = selectedVideoName
@@ -433,6 +519,8 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
         observedRateHz = null
         sampleCount = 0
         firstFrameInfoNs = null
+        firstTextureNs = null
+        droppedOutsideWindow = 0
         actualStartNs = 0L
         playCommandBeforeNs = 0L
         playCommandAfterNs = 0L
@@ -449,8 +537,7 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
         countdownNumber = 5
         phase = RunPhase.COUNTDOWN
         status = "5초 카운트다운 중 (아직 측정 저장 시작 전)"
-        // 영상은 매 실험 전에 새 MediaPlayer로 준비하여 이미 0ms 위치에 있습니다.
-        // 카운트다운 중 seekTo(0)를 호출하면 구형 디코더에서 시작을 늦출 수 있어 생략합니다.
+        // 첫 프레임 디코딩과 0ms 복귀를 마친 플레이어를 유지합니다.
         main.post(countdownTick)
         // 버튼 타임스탬프를 기준으로 남은 시간만 예약 (seekTo 처리 시간에 따른 지연 누적 방지)
         val remainingMs = ((targetStartNs - SystemClock.elapsedRealtimeNanos() + 999_999L) / 1_000_000L)
@@ -476,6 +563,8 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
             return
         }
         main.removeCallbacks(countdownTick)
+        runDisplayWidth = textureView?.width ?: 0
+        runDisplayHeight = textureView?.height ?: 0
         actualStartNs = SystemClock.elapsedRealtimeNanos()
         rawCapture.begin(actualStartNs)
         // 시작되는 센서 측정의 실제 이벤트 시각이 actualStartNs 이상인 샘플만 기록
@@ -484,7 +573,10 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
             gateEndNs = Long.MAX_VALUE
         }
         marks.add(VideoMark("ALS_LOG_START", actualStartNs, -1))
+        marks.add(VideoMark("VIDEO_PREPARATION_STARTED", preparationStartedNs, 0))
+        marks.add(VideoMark("VIDEO_PREPARATION_READY", preparationReadyNs, 0))
         phase = RunPhase.RUNNING
+        addMark("VIDEO_REVEAL_REQUEST", SystemClock.elapsedRealtimeNanos())
         status = "영상과 ALS 기록 진행 중"
         playCommandBeforeNs = SystemClock.elapsedRealtimeNanos()
         addMark("VIDEO_START_CALL_BEFORE", playCommandBeforeNs)
@@ -512,16 +604,20 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
             else -> return
         }
         runEndNs = SystemClock.elapsedRealtimeNanos()
+        val sensorSnapshot = synchronized(samplesLock) {
+            gateEndNs = runEndNs
+            val kept = CaptureWindow.snapshot(samples, gateStartNs, gateEndNs) { it.sensorNs }
+            droppedOutsideWindow = samples.size - kept.size
+            kept
+        }
         val rawSnapshot = rawCapture.finish(runEndNs)
         val rawRegistration = rawCapture.registration
-        synchronized(samplesLock) { gateEndNs = runEndNs }
         addMark("RUN_END_$reason", runEndNs)
         main.removeCallbacks(progressTick)
         phase = RunPhase.SAVING
         status = "CSV 저장 중..."
         val player = mediaPlayer
         try { player?.pause() } catch (_: Exception) { }
-        val sensorSnapshot = synchronized(samplesLock) { samples.toList() }
         val markSnapshot = marks.toList()
         val runMode = modeUsed
         val outputName = experimentId
@@ -566,7 +662,7 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
                         (wallAnchor * 1_000_000L + start - monoAnchor).toString(),
                         videoNameSnapshot).joinToString(",") { cell(it) })
                 }
-                if (scheduleEnabled) writePatternSchedule(File(folder, "pattern_schedule.csv"), runMode)
+                if (runScheduleEnabled) writePatternSchedule(File(folder, "pattern_schedule.csv"), runMode)
                 writeVideoMarks(File(folder, "video_timeline.csv"), markSnapshot, start, firstFrame)
                 writeLuxSamples(File(folder, "als_lux.csv"), sensorSnapshot, markSnapshot,
                     runMode, start, beforePlay, firstFrame)
@@ -574,6 +670,17 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
                 writeRunInfo(File(folder, "run_info.txt"), runMode, outputName,
                     reason, button, target, start, beforePlay, afterPlay, firstFrame,
                     end, wallAnchor, monoAnchor, sensorDetails, sensorSnapshot.size, rate)
+                val alignmentStatus = try {
+                    val valid = RecordingAlignment.generate(folder)
+                    "영상 위치 기준 보정 완료: ${valid}개 (alignment/)"
+                } catch (e: Exception) {
+                    try {
+                        File(folder, "alignment_error.txt").writeText(
+                            "Original data saved. Alignment failed: ${e.javaClass.simpleName}: ${e.message}\n",
+                            Charsets.UTF_8)
+                    } catch (_: Exception) { }
+                    "원본 저장 완료 · 시간축 보정 실패: ${e.message}"
+                }
                 main.post {
                     sampleCount = sensorSnapshot.size
                     observedRateHz = rate
@@ -581,6 +688,7 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
                     status = if (reason == "video_completed")
                         "정상 종료 · 저장 완료: Lux ${sensorSnapshot.size}개 / 영상 로그 ${markSnapshot.size}개"
                     else "영상 종료 사유: $reason · 데이터 저장 완료 (Lux ${sensorSnapshot.size}개)"
+                    status += " · $alignmentStatus"
                     lastResultStatus = status
                     phase = RunPhase.IDLE
                     loadSelectedVideo() // 다음 실험을 위해 처음부터 준비
@@ -634,7 +742,7 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
                                 beginNs: Long, firstFrame: Long?) {
         file.bufferedWriter(Charsets.UTF_8).use { out ->
             out.appendLine("event,elapsed_realtime_ns,relative_to_als_start_ms,relative_to_first_frame_info_ms,video_position_ms,query_half_duration_ns")
-            data.forEach { m ->
+            data.sortedBy { it.timestampNs }.forEach { m ->
                 out.appendLine("${m.type},${m.timestampNs},${relativeMs(m.timestampNs, beginNs)}," +
                         "${relativeMs(m.timestampNs, firstFrame)},${m.videoPositionMs},${m.queryHalfDurationNs}")
             }
@@ -655,18 +763,23 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
         val a = positions[lo]
         val b = positions[hi]
         val dt = b.timestampNs - a.timestampNs
-        if (dt <= 0L) return null
+        if (dt <= 0L || dt > MAX_POSITION_GAP_NS || b.videoPositionMs < a.videoPositionMs) return null
         val fraction = (t - a.timestampNs).toDouble() / dt
         return a.videoPositionMs + (b.videoPositionMs - a.videoPositionMs) * fraction
     }
 
     private fun assignPattern(positionMs: Double?, mode: PatternMode): PatternAssignment? {
-        if (positionMs == null || positionMs < 0.0 || positionMs >= mode.durationMs) return null
+        if (positionMs == null || !positionMs.isFinite() || positionMs < 0.0 || positionMs >= mode.durationMs) return null
         val zeroBased = (positionMs / mode.cycleMs).toInt().coerceIn(0, PATTERN_COUNT - 1)
-        val within = positionMs - zeroBased * mode.cycleMs
-        val kind = if (within < mode.patternDurationMs) "PATTERN" else "BLACK"
-        val nearest = min(min(within, kotlin.math.abs(within - mode.patternDurationMs)),
-            mode.cycleMs - within)
+        // CSV 시간표와 같은 정수 프레임 경계로 비교하여 반복 뺄셈의 반올림 차이를 피함.
+        val cycleFrames = mode.patternFrames + mode.blackFrames
+        val startFrame = zeroBased * cycleFrames
+        val startMs = startFrame * 1000.0 / mode.fps
+        val patternEndMs = (startFrame + mode.patternFrames) * 1000.0 / mode.fps
+        val cycleEndMs = (startFrame + cycleFrames) * 1000.0 / mode.fps
+        val kind = if (positionMs < patternEndMs) "PATTERN" else "BLACK"
+        val nearest = min(min(positionMs - startMs, kotlin.math.abs(positionMs - patternEndMs)),
+            cycleEndMs - positionMs)
         return PatternAssignment(zeroBased + 1, kind, nearest,
             if (nearest <= BOUNDARY_MARGIN_MS) "NEAR_TRANSITION" else "AWAY_FROM_TRANSITION")
     }
@@ -682,14 +795,14 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
                 // 첫 프레임 정보 콜백 이전 데이터는 P01로 강제 라벨링하지 않습니다.
                 val pos = if (firstFrame != null && s.sensorNs < firstFrame) null
                 else positionAt(s.sensorNs, positions)
-                val assigned = if (scheduleEnabled) assignPattern(pos, mode) else null
+                val assigned = if (runScheduleEnabled) assignPattern(pos, mode) else null
                 out.appendLine(
                     "${s.sensorNs},${s.callbackNs},${relativeMs(s.callbackNs, s.sensorNs)}," +
                             "${relativeMs(s.sensorNs, beginNs)},${relativeMs(s.sensorNs, playNs)}," +
                             "${relativeMs(s.sensorNs, firstFrame)},${pos?.let { fmt(it) } ?: ""}," +
                             "${assigned?.patternId ?: ""},${assigned?.kind ?: ""}," +
                             "${assigned?.distanceToBoundaryMs?.let { fmt(it) } ?: ""}," +
-                            "${assigned?.flag ?: "NO_POSITION_ESTIMATE"},${s.lux},${s.accuracy}"
+                            "${assigned?.flag ?: if (!runScheduleEnabled) "SCHEDULE_DISABLED" else "NO_POSITION_ESTIMATE"},${s.lux},${s.accuracy}"
                 )
             }
         }
@@ -707,7 +820,12 @@ video_file=see_selected_video.txt
 texture_frame_callbacks=$runFrameCount
 physical_light_onset=NOT_MEASURED
 rgb_channels=NOT_AVAILABLE_FROM_STANDARD_TYPE_LIGHT
-pattern_schedule=USER_ASSUMED_NOT_VERIFIED_AGAINST_VIDEO
+pattern_schedule=${if (runScheduleEnabled) "USER_CONFIRMED_TIMING_AND_ORDER_NOT_CONTENT_VERIFIED" else "DISABLED"}
+pattern_id_semantics=1_BASED_CYCLE_INDEX_BLACK_BELONGS_TO_PRECEDING_PATTERN
+video_actual_duration_ms=$runVideoDurationMs
+video_scale_mode=STRETCH_TO_FILL_NO_CROP
+pattern_view_width_px=$runDisplayWidth
+pattern_view_height_px=$runDisplayHeight
 device=${Build.MANUFACTURER} ${Build.MODEL}
 android_sdk=${Build.VERSION.SDK_INT}
 sensor_name=${light?.name ?: "NONE"}
@@ -715,7 +833,18 @@ sensor_reporting_mode=${light?.reportingMode ?: "UNKNOWN"}
 sensor_min_delay_us=${light?.minDelay ?: "UNKNOWN"}
 sensor_resolution_lux=${light?.resolution ?: "UNKNOWN"}
 requested_sample_period_us=$SENSOR_PERIOD_US
-requested_event_rate_hz=100
+sensor_sampling_mode=FASTEST
+requested_event_rate_hz=FASTEST_DEVICE_DEPENDENT
+target_event_rate_hz=100
+minimum_desired_event_rate_hz=97
+minimum_desired_rate_met=${rate?.let { it >= 97.0 } ?: false}
+recording_interval_resampled=false
+outside_capture_window_samples_discarded=$droppedOutsideWindow
+capture_window_end_exclusive=true
+video_preparation_start_ns=$preparationStartedNs
+video_preparation_ready_ns=$preparationReadyNs
+first_texture_update_after_resume_ns=${firstTextureNs ?: "UNAVAILABLE"}
+play_command_to_first_texture_update_ms=${firstTextureNs?.let { fmt((it - beforePlay) / 1e6) } ?: "UNAVAILABLE"}
 observed_event_rate_hz=${rate?.let { fmt(it) } ?: "UNAVAILABLE"}
 received_sensor_events=$count
 start_delay_requested_ms=$START_DELAY_MS
@@ -742,7 +871,7 @@ pattern_duration_ms=${fmt(mode.patternDurationMs)}
 black_duration_ms=${fmt(mode.blackDurationMs)}
 video_position_poll_target_ms=$VIDEO_POLL_MS
 boundary_flag_margin_ms=$BOUNDARY_MARGIN_MS
-notes=All elapsed_realtime_ns timestamps share elapsedRealtimeNanos clock domain. Sensor timestamp is event sample time, callback timestamp is app receipt time. Countdown target and actual start are both recorded; 5s is a scheduling target, not an exact hardware guarantee. VIDEO_FIRST_FRAME_INFO reports that the media player submitted a frame for rendering, NOT light emission on physical LCD. VIDEO_POSITION is polled, NOT frame accurate. estimated_video_position_ms and per-pattern labels are interpolated approximations. NEAR_TRANSITION is a caution flag, not a calibrated confidence interval. Sensor response latency / actual display light onset require optical calibration. Sensor 100Hz is only a requested sampling period, not a guaranteed output rate.
+notes=All elapsed_realtime_ns timestamps share elapsedRealtimeNanos clock domain. Sensor timestamp is event sample time, callback timestamp is app receipt time. Countdown target and actual start are both recorded; 5s is a scheduling target, not an exact hardware guarantee. VIDEO_FIRST_FRAME_INFO reports that the media player submitted a frame for rendering, NOT light emission on physical LCD. VIDEO_POSITION is polled, NOT frame accurate. estimated_video_position_ms and per-pattern labels are interpolated approximations. NEAR_TRANSITION is a caution flag, not a calibrated confidence interval. Sensor response latency / actual display light onset require optical calibration. FASTEST is a device-dependent request; 100Hz is a target, not a guaranteed output rate. Prepared first-frame reveal is not physical light onset. First-frame info may be unavailable after warm-up.
 """.trimIndent() + "\n", Charsets.UTF_8)
     }
 }
@@ -757,6 +886,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun ALSExperimentScreen() {
     val context = LocalContext.current
+    val keyboard = LocalSoftwareKeyboardController.current
     val activity = context as ComponentActivity
     val manager = remember { AlsRunManager(context.applicationContext) }
     var experimentName by remember { mutableStateOf("Tablet_01") }
@@ -794,15 +924,23 @@ private fun ALSExperimentScreen() {
     DisposableEffect(activity, fullscreen) {
         val previous = activity.window.decorView.systemUiVisibility
         val previousBrightness = activity.window.attributes.screenBrightness
+        val previousOrientation = activity.requestedOrientation
         if (fullscreen) {
+            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LOCKED
             activity.window.attributes = activity.window.attributes.apply { screenBrightness = 1f }
             activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             activity.window.decorView.systemUiVisibility =
                 View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                        View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                        View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                        View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                        View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
         }
         onDispose {
-            if (fullscreen) activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            if (fullscreen) {
+                activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                activity.requestedOrientation = previousOrientation
+            }
             activity.window.attributes = activity.window.attributes.apply { screenBrightness = previousBrightness }
             activity.window.decorView.systemUiVisibility = previous
         }
@@ -822,13 +960,7 @@ private fun ALSExperimentScreen() {
                 val output = context.contentResolver.openOutputStream(target)
                     ?: throw IOException("출력 파일을 열 수 없습니다")
                 output.use { fileStream ->
-                    ZipOutputStream(fileStream).use { zip ->
-                        folder.listFiles()?.filter { it.isFile }?.forEach { f ->
-                            zip.putNextEntry(ZipEntry(f.name))
-                            f.inputStream().use { it.copyTo(zip) }
-                            zip.closeEntry()
-                        }
-                    }
+                    RecordingArchive.write(folder, fileStream)
                 }
                 exportMessage = "ZIP 내보내기 완료"
             } catch (e: Exception) {
@@ -868,12 +1000,20 @@ private fun ALSExperimentScreen() {
                 Button(enabled = manager.phase == RunPhase.IDLE,
                     onClick = { picker.launch(arrayOf("video/*")) }) { Text("기기에서 영상 선택") }
                 Text("아래 시간표는 선택 영상과 자동 검증되지 않습니다. 일치하는 경우에만 패턴 라벨을 사용하세요.", fontSize = 12.sp)
+                Text("화면 끝까지 패턴 전체를 늘려 표시합니다. 영상과 화면 비율이 다르면 도형 비율이 달라집니다.", fontSize = 12.sp)
                 Text("분석용 패턴 시간표", fontSize = 19.sp)
+                if (manager.videoReady) {
+                    Text("영상 길이: ${manager.videoDurationMs / 1000.0}초 / 시간표: ${fmtDuration(manager.selectedMode.durationMs)}", fontSize = 12.sp)
+                    if (!manager.scheduleDurationMatches) {
+                        Text("영상 길이가 시간표와 달라 패턴 라벨을 사용할 수 없습니다.",
+                            color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                    }
+                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = manager.scheduleEnabled,
-                        enabled = manager.phase == RunPhase.IDLE,
+                        enabled = manager.phase == RunPhase.IDLE && manager.videoReady && manager.scheduleDurationMatches,
                         onCheckedChange = { manager.scheduleEnabled = it })
-                    Text("선택 영상과 아래 시간표가 일치함 (패턴 라벨 활성화)")
+                    Text("영상이 0초부터 P01→P30 순서이고 각 패턴 뒤 검정 구간이 있음 (라벨 활성화)")
                 }
                 PatternMode.values().forEach { mode ->
                     Row(
@@ -910,11 +1050,11 @@ private fun ALSExperimentScreen() {
                 }
                 Text("현재 조도: ${manager.currentLux?.let { String.format(Locale.US, "%.2f", it) } ?: "--"} lux",
                     fontSize = 23.sp, color = MaterialTheme.colorScheme.primary)
-                Text("요청: 100Hz / 영상 위치 폴링: 약 20ms", fontSize = 12.sp)
+                Text("요청: 센서 최대 속도 / 목표: 100Hz (97Hz 이상 실측 확인) / 영상 위치 폴링: 약 20ms", fontSize = 12.sp)
                 Button(
                     enabled = manager.videoReady && manager.sensorActive && manager.phase == RunPhase.IDLE,
                     modifier = Modifier.fillMaxWidth(),
-                    onClick = { manager.arm(experimentName) }
+                    onClick = { keyboard?.hide(); manager.arm(experimentName) }
                 ) { Text("실험 시작 (5초 후 자동 실행)") }
                 Text("카운트다운 중 뒤로 가기: 취소 / 재생 중 뒤로 가기: 종료 및 저장", fontSize = 12.sp)
                 Text("상태: ${manager.status}")

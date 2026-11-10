@@ -2,6 +2,26 @@
 
 검사일: 2026-11-08. 대상 설정: SM-T550, minSdk 25 / compileSdk·targetSdk 35.
 
+## 최신 버전 0.4
+
+첫 프레임 사전 준비 및 0ms 되감기 확인, 가로 전체 화면 선적용,
+센서 기록 종료 경계의 원자적 스냅샷·필터링을 추가했다.
+추가 제조사 센서의 원시 데이터에도 같은 종료 경계 필터를 적용한다.
+
+- `python tools/check_android.py --apk`: BUILD SUCCESSFUL in 52s.
+- 단위 테스트 7개 성공: CSV 2개, 종료 경계 2개, 준비 상태/콜백 순서 3개.
+- 종료 경계 테스트에는 실제 SM-T550 로그의 종료 후 샘플 timestamp를 사용했다.
+- lint 오류 0개, 경고 7개: 버전 업데이트 4개, 가로 방향 제한 1개,
+  백업 규칙 1개, 앱 아이콘 1개. 구형 전체 화면 API deprecation 경고는 제거했다.
+- APK versionName 0.4 / versionCode 2, 약 8.37 MiB. v2 서명 검증 성공.
+- SHA-256: `b10951fb712d502c35133aff5dd74692c4517c5ba4bd68fbecd76970a3e4b220`.
+
+디코더 초기화/화면 전환 지연을 줄이기 위한 수정이다. 실제 지연 감소량,
+0ms 되감기 및 첫 프레임 준비 성공 여부는 SM-T550에서 다시 확인해야 한다.
+실제 발광 시각이나 0ms 재생 지연을 보장하지 않는다.
+
+아래 내용은 이전 버전 0.3에서 완료한 최초 검사 기록이다.
+
 ## 완료한 검사
 
 Microsoft OpenJDK 17, Gradle 8.9, Android SDK Platform 35와 Build Tools 34.0.0으로 실행했다.

@@ -15,7 +15,8 @@ internal class RawSensorCapture(context: Context) : SensorEventListener {
     private val manager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     val candidates: List<Sensor> = manager.getSensorList(Sensor.TYPE_ALL).filter { it.type >= 65536 }
     private val lock = Any()
-    private val rows = ArrayList<String>()
+    private data class Reading(val timestampNs: Long, val csv: String)
+    private val rows = ArrayList<Reading>()
     private var thread: HandlerThread? = null
     private var begin = Long.MAX_VALUE
     private var end = Long.MAX_VALUE
@@ -39,7 +40,10 @@ internal class RawSensorCapture(context: Context) : SensorEventListener {
     fun begin(timestamp: Long) = synchronized(lock) { begin = timestamp }
 
     fun finish(timestamp: Long): List<String> {
-        val snapshot = synchronized(lock) { end = timestamp; rows.toList() }
+        val snapshot = synchronized(lock) {
+            end = timestamp
+            CaptureWindow.snapshot(rows, begin, end) { it.timestampNs }.map { it.csv }
+        }
         stop()
         return snapshot
     }
@@ -53,9 +57,10 @@ internal class RawSensorCapture(context: Context) : SensorEventListener {
     override fun onSensorChanged(event: SensorEvent) {
         val received = SystemClock.elapsedRealtimeNanos()
         synchronized(lock) {
-            if (event.timestamp >= begin && event.timestamp < end) {
-                rows.add("${event.timestamp},$received,${event.sensor.type},${event.accuracy}," +
-                    event.values.joinToString(";"))
+            if (CaptureWindow.contains(event.timestamp, begin, end)) {
+                rows.add(Reading(event.timestamp,
+                    "${event.timestamp},$received,${event.sensor.type},${event.accuracy}," +
+                    event.values.joinToString(";")))
             }
         }
     }

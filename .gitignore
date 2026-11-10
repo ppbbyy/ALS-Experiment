@@ -10,3 +10,7 @@ kivy_preview/.test-video.mp4
 kivy_preview/.smoke*.png
 kivy_preview/*.log
 .build-tools/
+
+.kotlin/
+*.apk
+!ALS-Experiment-0.6-debug.apk
