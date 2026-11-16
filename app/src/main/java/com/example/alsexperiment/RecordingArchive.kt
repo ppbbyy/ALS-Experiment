@@ -9,7 +9,7 @@ internal object RecordingArchive {
     fun write(folder: File, output: OutputStream) {
         ZipOutputStream(output).use { zip ->
             folder.walkTopDown().filter { it.isFile }.forEach { file ->
-                zip.putNextEntry(ZipEntry(file.relativeTo(folder).invariantSeparatorsPath))
+                zip.putNextEntry(ZipEntry(file.relativeTo(folder).invariantSeparatorsPath).apply { time = file.lastModified() })
                 file.inputStream().use { it.copyTo(zip) }
                 zip.closeEntry()
             }

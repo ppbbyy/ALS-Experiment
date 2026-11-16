@@ -10,8 +10,8 @@ android {
         applicationId = "com.example.alsexperiment"
         minSdk = 25
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.6"
+        versionCode = 6
+        versionName = "0.8"
     }
     buildFeatures { compose = true }
     compileOptions {

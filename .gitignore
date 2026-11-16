@@ -14,3 +14,7 @@ kivy_preview/*.log
 .kotlin/
 *.apk
 !ALS-Experiment-0.6-debug.apk
+
+lan_received/
+
+!ALS-Experiment-0.8-debug.apk

@@ -53,6 +53,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import org.json.JSONObject
+import java.util.UUID
 import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -113,6 +115,14 @@ private data class PatternAssignment(
  * 실제 디스플레이 광학 발광 시각/ALS 아날로그 응답 지연까지 0으로 만드는 것은 불가능합니다.
  */
 private class AlsRunManager(private val context: Context) : SensorEventListener {
+    var receiverAddress by mutableStateOf(context.getSharedPreferences("lan", Context.MODE_PRIVATE).getString("address", "") ?: "")
+    var transferStatus by mutableStateOf("노트북 전송 꺼짐")
+        private set
+    private var uploader: LanUploader? = null
+    private var latestUploadId = ""
+    private fun lanSnapshot(from: Int): List<LanSample> = synchronized(samplesLock) {
+        samples.subList(minOf(from, samples.size), minOf(from + 200, samples.size)).map { LanSample(it.sensorNs, it.callbackNs, it.lux, it.accuracy) }
+    }
     val rawCapture = RawSensorCapture(context)
     var rawSensor by mutableStateOf<Sensor?>(null)
     var scheduleEnabled by mutableStateOf(false)
@@ -489,6 +499,15 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
     }
 
     fun arm(experimentName: String) {
+        val address = receiverAddress.trim().trimEnd('/')
+        if (address.isNotEmpty()) {
+            val uri = Uri.parse(address)
+            if (uri.scheme != "http" || uri.host.isNullOrBlank() || uri.path.orEmpty().isNotEmpty() || uri.query != null || uri.fragment != null || uri.userInfo != null) {
+                status = "노트북 주소를 http://192.168.0.10:8765 형식으로 입력하세요."
+                return
+            }
+        }
+        context.getSharedPreferences("lan", Context.MODE_PRIVATE).edit().putString("address", address).apply()
         val player = mediaPlayer
         if (phase != RunPhase.IDLE || !videoReady || !sensorActive || player == null) {
             status = "영상 준비와 조도 센서 연결 상태를 확인해 주세요."
@@ -566,6 +585,24 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
         runDisplayWidth = textureView?.width ?: 0
         runDisplayHeight = textureView?.height ?: 0
         actualStartNs = SystemClock.elapsedRealtimeNanos()
+        val address = receiverAddress.trim()
+        val uploadId = UUID.randomUUID().toString()
+        latestUploadId = uploadId
+        uploader = if (address.isBlank()) null else {
+            val metadata = JSONObject()
+                .put("run_id", uploadId).put("experiment_name", experimentId)
+                .put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
+                .put("android_sdk", Build.VERSION.SDK_INT).put("sensor_name", sensor?.name ?: "NONE")
+                .put("sensor_resolution_lux", sensor?.resolution?.toDouble() ?: 0.0)
+                .put("video_name", runVideoName).put("video_duration_ms", runVideoDurationMs)
+                .put("mode", modeUsed.name).put("schedule_enabled", runScheduleEnabled)
+                .put("sampling_mode", "FASTEST").put("wall_anchor_epoch_ms", wallAnchorEpochMs)
+                .put("mono_anchor_ns", monoAnchorNs.toString()).put("actual_start_ns", actualStartNs.toString())
+            LanUploader(address, metadata, actualStartNs, ::lanSnapshot) { message ->
+                main.post { if (latestUploadId == uploadId) transferStatus = message }
+            }
+        }
+        transferStatus = if (uploader == null) "노트북 전송 꺼짐" else "노트북 연결 중"
         rawCapture.begin(actualStartNs)
         // 시작되는 센서 측정의 실제 이벤트 시각이 actualStartNs 이상인 샘플만 기록
         synchronized(samplesLock) {
@@ -578,6 +615,7 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
         phase = RunPhase.RUNNING
         addMark("VIDEO_REVEAL_REQUEST", SystemClock.elapsedRealtimeNanos())
         status = "영상과 ALS 기록 진행 중"
+        uploader?.start()
         playCommandBeforeNs = SystemClock.elapsedRealtimeNanos()
         addMark("VIDEO_START_CALL_BEFORE", playCommandBeforeNs)
         try {
@@ -610,6 +648,10 @@ private class AlsRunManager(private val context: Context) : SensorEventListener 
             droppedOutsideWindow = samples.size - kept.size
             kept
         }
+        uploader?.finish(sensorSnapshot.map { LanSample(it.sensorNs, it.callbackNs, it.lux, it.accuracy) },
+            JSONObject().put("run_end_ns", runEndNs.toString()).put("reason", reason)
+                .put("sample_count", sensorSnapshot.size))
+        uploader = null
         val rawSnapshot = rawCapture.finish(runEndNs)
         val rawRegistration = rawCapture.registration
         addMark("RUN_END_$reason", runEndNs)
@@ -891,6 +933,7 @@ private fun ALSExperimentScreen() {
     val manager = remember { AlsRunManager(context.applicationContext) }
     var experimentName by remember { mutableStateOf("Tablet_01") }
     var exportMessage by remember { mutableStateOf("") }
+    var archiveSending by remember { mutableStateOf(false) }
 
     DisposableEffect(manager, activity) {
         manager.startSensor()
@@ -996,6 +1039,14 @@ private fun ALSExperimentScreen() {
                     modifier = Modifier.fillMaxWidth(),
                     enabled = manager.phase == RunPhase.IDLE
                 )
+                OutlinedTextField(
+                    value = manager.receiverAddress, onValueChange = { manager.receiverAddress = it },
+                    label = { Text("노트북 주소 (비우면 전송 안 함)") },
+                    placeholder = { Text("http://192.168.0.10:8765") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth(),
+                    enabled = manager.phase == RunPhase.IDLE
+                )
+                Text(manager.transferStatus)
                 Text(manager.selectedVideoName)
                 Button(enabled = manager.phase == RunPhase.IDLE,
                     onClick = { picker.launch(arrayOf("video/*")) }) { Text("기기에서 영상 선택") }
@@ -1064,6 +1115,28 @@ private fun ALSExperimentScreen() {
                 }
                 manager.savedFolder?.let { folder ->
                     Text("저장 경로: ${folder.absolutePath}", fontSize = 11.sp)
+                    Button(
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !archiveSending && manager.phase == RunPhase.IDLE && manager.receiverAddress.isNotBlank(),
+                        onClick = {
+                            val address = manager.receiverAddress
+                            archiveSending = true
+                            exportMessage = "노트북으로 ZIP 전송 중..."
+                            Thread {
+                                val result = try {
+                                    LanArchiveUploader.send(folder, context.cacheDir, address)
+                                    "노트북 ZIP 보관 완료: ${folder.name}.zip"
+                                } catch (e: Exception) {
+                                    "ZIP 전송 실패: ${e.message} · 연결 확인 후 다시 눌러 주세요."
+                                }
+                                activity.runOnUiThread {
+                                    exportMessage = result
+                                    archiveSending = false
+                                }
+                            }.start()
+                        }
+                    ) { Text(if (archiveSending) "ZIP 전송 중..." else "노트북으로 내보내기 (ZIP)") }
+
                     OutlinedButton(
                         modifier = Modifier.fillMaxWidth(),
                         onClick = { exporter.launch("${folder.name}.zip") }
